@@ -1,0 +1,83 @@
+name: CI
+
+# 触发条件：推 main、提 PR 到 main、手动点一下
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 只需要读仓库权限，不给任何写权限
+permissions:
+  contents: read
+
+# 同一个分支连续推送时，自动取消上一次没跑完的任务，省 CI 时间
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: ruff + mypy + pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      # 一个版本挂了不取消另一个版本，完整看到所有结果
+      fail-fast: false
+      matrix:
+        # pyproject 里声明支持 >=3.11,<3.13，所以两个版本都测
+        python-version: ["3.11", "3.12"]
+
+    env:
+      # uv 全程使用这个 Python 版本：uv sync 和 uv run 都跟着走
+      UV_PYTHON: ${{ matrix.python-version }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          # 复用 GitHub 缓存，依赖下载快很多
+          enable-cache: true
+
+      - name: 同步依赖（严格按 uv.lock）
+        # --locked 表示锁文件和 pyproject 不一致就直接失败，
+        # 保证 CI 装的依赖跟你本地提交的那一套完全一致
+        run: uv sync --locked
+
+      - name: ruff 静态检查
+        run: uv run ruff check src tests
+
+      - name: mypy 严格类型检查
+        run: uv run mypy
+
+      - name: pytest（离线 + 覆盖率门槛）
+        # 不传任何密钥、不联网；测试里的 autouse 夹具会屏蔽 .env 并阻断 socket
+        run: uv run pytest
+
+      - name: 确认 CI 环境里不存在真实密钥
+        run: |
+          if [ -n "${LLM_API_KEY:-}" ]; then
+            echo "::error::CI 环境中不允许出现真实 LLM_API_KEY"
+            exit 1
+          fi
+          if [ -f .env ]; then
+            echo "::error::仓库里不应存在 .env 文件"
+            exit 1
+          fi
+          echo "环境干净：无 .env、无 LLM_API_KEY，测试全程走 FakeLLM / mock"
+
+      - name: 密钥泄漏检查
+        run: |
+          if git ls-files | grep -qx '\.env'; then
+            echo "::error::.env 被提交进仓库了，请立即清理历史"
+            exit 1
+          fi
+          if git log --all --name-only --pretty=format: | grep -qx '\.env'; then
+            echo "::error::历史提交里出现过 .env，请清理 Git 历史"
+            exit 1
+          fi
+          echo "历史与当前提交中均未出现 .env"
