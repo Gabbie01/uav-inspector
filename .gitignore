@@ -1,0 +1,30 @@
+# 环境与密钥
+.env
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# 工具缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# 运行产物
+reports/
+outputs/
+*.log
+
+# 例外：样例巡检日志是虚构测试数据，必须入库（否则测试跑不起来）
+!data/samples/*.log
+
+# macOS
+.DS_Store
