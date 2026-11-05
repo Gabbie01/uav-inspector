@@ -49,7 +49,7 @@ jobs:
         run: uv sync --locked
 
       - name: ruff 静态检查
-        run: uv run ruff check src tests
+        run: uv run ruff check src tests scripts
 
       - name: mypy 严格类型检查
         run: uv run mypy
@@ -57,6 +57,11 @@ jobs:
       - name: pytest（离线 + 覆盖率门槛）
         # 不传任何密钥、不联网；测试里的 autouse 夹具会屏蔽 .env 并阻断 socket
         run: uv run pytest
+
+      - name: 幻觉闸门演示（离线自检，脚本内含 PASS/FAIL 断言）
+        # 这是给招聘方看的可复现证据：脚本会自检闸门是否拦住了所有注入的幻觉，
+        # 任何一条没拦住就以非 0 退出码让 CI 变红
+        run: uv run python scripts/hallucination_demo.py
 
       - name: 确认 CI 环境里不存在真实密钥
         run: |
