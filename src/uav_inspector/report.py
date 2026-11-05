@@ -98,6 +98,26 @@ def _evidence_exists(evidence: str, records: list[LogRecord]) -> bool:
     return any(needle == record.raw or needle in record.raw for record in records)
 
 
+def resolve_overall_status(draft_status: Severity, findings: list[Finding]) -> Severity:
+    """整体状态由代码从**清洗后**的问题项重算，不采信模型给的 overall_status。
+
+    原因：整体状态和「问题分级（最高 X）」是同一个结论的两种写法，必须同源。
+    如果直接沿用模型的 overall_status，事实校验剔除虚构问题项后就会出现
+    自相矛盾的报告头——真实模型实测就出现过「整体状态：中等 / 最高 严重」。
+    同 build_statistics 的口径：客观结论一律由代码从原始数据重算。
+    """
+    computed = Severity.NORMAL
+    for finding in findings:
+        computed = max(computed, finding.severity, key=lambda s: s.rank)
+    if draft_status != computed:
+        logger.warning(
+            "整体状态与问题明细不一致：模型给出 %s，按清洗后问题项重算为 %s，已采用重算值",
+            draft_status.value,
+            computed.value,
+        )
+    return computed
+
+
 def generate_report(
     client: LLMClient,
     log_text: str,
@@ -130,7 +150,7 @@ def generate_report(
     return InspectionReport(
         report_date=report_date or date.today().isoformat(),
         site=site,
-        overall_status=draft.overall_status,
+        overall_status=resolve_overall_status(draft.overall_status, findings),
         executive_summary=draft.executive_summary,
         findings=findings,
         immediate_actions=draft.immediate_actions,

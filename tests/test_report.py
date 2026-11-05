@@ -12,6 +12,7 @@ from uav_inspector.models import DeviceKind, LogRecord, ReportDraft, Severity
 from uav_inspector.report import (
     build_statistics,
     generate_report,
+    resolve_overall_status,
     severity_prior_table,
     validate_findings,
 )
@@ -269,6 +270,91 @@ class TestGenerateReport:
         log = "2026-10-28 08:12:03 [RD-EO-01] INFO 正常\n这一行无法解析\n"
         report = generate_report(client, log, site="测试")
         assert report.statistics.unparsed_lines == 1
+
+
+class TestResolveOverallStatus:
+    """回归：真实模型实测出现过「整体状态 中等 / 最高 严重」的自相矛盾报告头。
+
+    这个 bug 只有接真实模型才会暴露——FakeLLM 的整体等级本来就是从
+    它自己造的问题项算出来的，两者恒等，所以离线 demo 永远测不出来。
+    """
+
+    def test_model_status_lower_than_findings_is_corrected(self) -> None:
+        findings = [
+            _draft(
+                findings=[
+                    {
+                        "device_id": "RF-DET-01",
+                        "severity": "严重",
+                        "title": "a",
+                        "detail": "d",
+                        "evidence": [],
+                    }
+                ]
+            ).findings[0]
+        ]
+        # 模型说「中等」，明细里最高是「严重」→ 必须以明细为准
+        assert resolve_overall_status(Severity.MEDIUM, findings) is Severity.HIGH
+
+    def test_model_status_higher_than_findings_is_corrected(self) -> None:
+        findings = [
+            _draft(
+                findings=[
+                    {
+                        "device_id": "RF-DET-01",
+                        "severity": "轻微",
+                        "title": "a",
+                        "detail": "d",
+                        "evidence": [],
+                    }
+                ]
+            ).findings[0]
+        ]
+        # 模型说「紧急」但明细只有「轻微」→ 同样以明细为准
+        assert resolve_overall_status(Severity.CRITICAL, findings) is Severity.LOW
+
+    def test_no_findings_gives_normal(self) -> None:
+        assert resolve_overall_status(Severity.CRITICAL, []) is Severity.NORMAL
+
+    def test_matching_status_is_kept(self) -> None:
+        findings = [
+            _draft(
+                findings=[
+                    {
+                        "device_id": "RF-DET-01",
+                        "severity": "严重",
+                        "title": "a",
+                        "detail": "d",
+                        "evidence": [],
+                    }
+                ]
+            ).findings[0]
+        ]
+        assert resolve_overall_status(Severity.HIGH, findings) is Severity.HIGH
+
+    def test_report_head_is_consistent_with_findings(self) -> None:
+        """端到端：报告头的整体状态必须等于明细的最高等级。"""
+        client = StubLLM(
+            {
+                "overall_status": "中等",
+                "executive_summary": "摘要。",
+                "findings": [
+                    {
+                        "device_id": "RF-DET-01",
+                        "severity": "严重",
+                        "title": "设备离线",
+                        "detail": "d",
+                        "evidence": [],
+                    }
+                ],
+                "immediate_actions": [],
+                "follow_up_actions": [],
+            }
+        )
+        log = "2026-10-28 08:12:03 [RF-DET-01] ERROR 压制设备离线，前端面板显示无信号\n"
+        report = generate_report(client, log, site="测试")
+        assert report.overall_status is report.statistics.highest_severity
+        assert report.overall_status is Severity.HIGH
 
 
 class TestSeverityPriorTable:

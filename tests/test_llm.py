@@ -12,6 +12,7 @@ import pytest
 from uav_inspector.llm import (
     FakeLLM,
     LLMError,
+    OpenAICompatibleClient,
     extract_json,
     generate_draft,
 )
@@ -30,6 +31,100 @@ class ScriptedLLM:
         if not self._responses:
             raise AssertionError("ScriptedLLM 的响应已用尽，但代码又发起了一次调用")
         return self._responses.pop(0)
+
+
+class _FakeMessage:
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+
+class _FakeChoice:
+    def __init__(self, content: str) -> None:
+        self.message = _FakeMessage(content)
+
+
+class _FakeResponse:
+    def __init__(self, content: str) -> None:
+        self.choices = [_FakeChoice(content)]
+
+
+class _FakeCompletions:
+    """模拟 openai SDK 的 client.chat.completions.create。"""
+
+    def __init__(self, *outcomes: object) -> None:
+        self._outcomes = list(outcomes)
+        self.kwargs: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> _FakeResponse:
+        self.kwargs.append(kwargs)
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        assert isinstance(outcome, str)
+        return _FakeResponse(outcome)
+
+
+class _FakeOpenAI:
+    def __init__(self, completions: _FakeCompletions) -> None:
+        self.chat = type("_Chat", (), {"completions": completions})()
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _make_client(
+    monkeypatch: pytest.MonkeyPatch, outcomes: list[object], **settings_kwargs: object
+) -> tuple[OpenAICompatibleClient, _FakeCompletions]:
+    """构造一个注入了假 OpenAI 客户端的 OpenAICompatibleClient。"""
+    import openai
+
+    from uav_inspector.config import Settings
+
+    completions = _FakeCompletions(*outcomes)
+    fake = _FakeOpenAI(completions)
+    monkeypatch.setattr(openai, "OpenAI", lambda **kwargs: fake)
+
+    base: dict[str, object] = {
+        "llm_api_key": "test-key",
+        "llm_base_url": "https://example.invalid/v1",
+        "llm_model": "test-model",
+        "llm_timeout_s": 1.0,
+        "llm_max_retries": 3,
+        "_env_file": None,
+    }
+    base.update(settings_kwargs)
+    settings = Settings(**base)  # type: ignore[arg-type]
+    return OpenAICompatibleClient(settings), completions
+
+
+def _sdk_error(kind: str) -> Exception:
+    """构造一个真实的 openai SDK 异常实例（不联网）。"""
+    import httpx2
+    import openai
+
+    request = httpx2.Request("POST", "https://example.invalid/v1/chat/completions")
+    if kind == "timeout":
+        return openai.APITimeoutError(request=request)
+    if kind == "connection":
+        return openai.APIConnectionError(request=request)
+    if kind == "rate_limit":
+        response = httpx2.Response(429, request=request)
+        return openai.RateLimitError("触发限流", response=response, body=None)
+    if kind == "server":
+        response = httpx2.Response(500, request=request)
+        return openai.APIStatusError("服务端错误", response=response, body=None)
+    raise ValueError(f"未知的异常类型：{kind}")
+
+
+@pytest.fixture
+def no_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """拦截退避 sleep，记录调用间隔但真的不睡。"""
+    from uav_inspector import llm as llm_module
+
+    slept: list[float] = []
+    monkeypatch.setattr(llm_module.time, "sleep", lambda seconds: slept.append(seconds))
+    return slept
 
 
 def _record(
@@ -189,3 +284,109 @@ class TestFakeLLM:
         assert client.calls
         _, user_prompt = client.calls[0]
         assert records[0].raw in user_prompt
+
+
+class TestOpenAICompatibleClient:
+    """真实客户端的重试/退避/错误包装行为，全部通过 mock 离线验证。"""
+
+    def test_success_returns_content(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client, completions = _make_client(monkeypatch, ['{"ok": true}'])
+        assert client.complete_json("sys", "usr") == '{"ok": true}'
+        assert len(completions.kwargs) == 1
+
+    def test_request_parameters(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client, completions = _make_client(
+            monkeypatch, ['{"ok": true}'], llm_model="my-model", llm_temperature=0.7
+        )
+        client.complete_json("sys", "usr")
+        kwargs = completions.kwargs[0]
+        assert kwargs["model"] == "my-model"
+        assert kwargs["temperature"] == 0.7
+        assert kwargs["response_format"] == {"type": "json_object"}
+        messages = kwargs["messages"]
+        assert isinstance(messages, list)
+        assert messages[0]["role"] == "system"
+        assert messages[0]["content"] == "sys"
+        assert messages[1]["role"] == "user"
+        assert messages[1]["content"] == "usr"
+
+    @pytest.mark.parametrize(
+        "kind", ["timeout", "connection", "rate_limit", "server"]
+    )
+    def test_retryable_error_then_success(
+        self, monkeypatch: pytest.MonkeyPatch, no_sleep: list[float], kind: str
+    ) -> None:
+        client, completions = _make_client(
+            monkeypatch, [_sdk_error(kind), '{"ok": true}']
+        )
+        assert client.complete_json("sys", "usr") == '{"ok": true}'
+        assert len(completions.kwargs) == 2
+        assert len(no_sleep) == 1  # 退避一次
+
+    def test_exhausted_retries_raises_llm_error(
+        self, monkeypatch: pytest.MonkeyPatch, no_sleep: list[float]
+    ) -> None:
+        client, completions = _make_client(
+            monkeypatch,
+            [_sdk_error("timeout") for _ in range(3)],
+            llm_max_retries=3,
+        )
+        with pytest.raises(LLMError) as excinfo:
+            client.complete_json("sys", "usr")
+        assert "3 次重试" in str(excinfo.value)
+        assert len(completions.kwargs) == 3
+        assert len(no_sleep) == 2  # 最后一次失败后不再退避
+
+    def test_backoff_grows_and_is_capped(
+        self, monkeypatch: pytest.MonkeyPatch, no_sleep: list[float]
+    ) -> None:
+        client, _ = _make_client(
+            monkeypatch,
+            [_sdk_error("timeout") for _ in range(6)],
+            llm_max_retries=6,
+        )
+        with pytest.raises(LLMError):
+            client.complete_json("sys", "usr")
+        assert len(no_sleep) == 5
+        assert all(s > 0 for s in no_sleep)
+        assert all(s <= 30.0 for s in no_sleep)
+        assert no_sleep[0] < no_sleep[-1]  # 指数退避递增
+
+    def test_non_retryable_error_propagates_immediately(
+        self, monkeypatch: pytest.MonkeyPatch, no_sleep: list[float]
+    ) -> None:
+        boom = ValueError("参数不合法")
+        client, completions = _make_client(monkeypatch, [boom])
+        with pytest.raises(ValueError):
+            client.complete_json("sys", "usr")
+        assert len(completions.kwargs) == 1
+        assert no_sleep == []
+
+    def test_empty_content_raises_llm_error(
+        self, monkeypatch: pytest.MonkeyPatch, no_sleep: list[float]
+    ) -> None:
+        client, completions = _make_client(monkeypatch, ["   "])
+        with pytest.raises(LLMError) as excinfo:
+            client.complete_json("sys", "usr")
+        assert "空内容" in str(excinfo.value)
+        assert len(completions.kwargs) == 1
+
+    def test_missing_api_key_raises_llm_error(self) -> None:
+        from uav_inspector.config import Settings
+
+        settings = Settings(llm_api_key="", _env_file=None)  # type: ignore[arg-type]
+        with pytest.raises(LLMError) as excinfo:
+            OpenAICompatibleClient(settings)
+        assert "LLM_API_KEY" in str(excinfo.value)
+
+    def test_close_delegates_to_sdk(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import openai
+
+        client, _ = _make_client(monkeypatch, ['{"ok": true}'])
+        fake = client._client  # noqa: SLF001 - 测试内部状态
+        assert isinstance(fake, _FakeOpenAI)
+        client.close()
+        assert fake.closed is True
+        assert openai is not None
