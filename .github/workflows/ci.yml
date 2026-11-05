@@ -51,6 +51,13 @@ jobs:
       - name: ruff 静态检查
         run: uv run ruff check src tests scripts
 
+      - name: Makefile 可解析（make 冒烟）
+        # 曾经把目标名写成 demo:hallucination，macOS 自带的 GNU Make 3.81 会让整份
+        # Makefile 解析失败（README 第一条 make 命令就炸），而 ubuntu 上的 Make 4.x
+        # 察觉不到。这里显式跑一次 make，把「文档里的命令真的能用」也纳入 CI。
+        run: make -n help && make -n test && make -n lint \
+          && make -n demo-hallucination && make -n verify-examples
+
       - name: mypy 严格类型检查
         run: uv run mypy
 
@@ -62,6 +69,11 @@ jobs:
         # 这是给招聘方看的可复现证据：脚本会自检闸门是否拦住了所有注入的幻觉，
         # 任何一条没拦住就以非 0 退出码让 CI 变红
         run: uv run python scripts/hallucination_demo.py
+
+      - name: 真实报告样例事实校验（离线自检）
+        # 拿原始日志当唯一真相，逐条回查 docs/examples/ 里三份真实报告的
+        # 证据行、设备编号与统计口径，防止样例悄悄过期
+        run: uv run python scripts/verify_examples.py
 
       - name: 确认 CI 环境里不存在真实密钥
         run: |
